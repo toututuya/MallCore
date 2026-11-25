@@ -288,7 +288,7 @@ docker compose -f docker/local/docker-compose.yml up -d
 
 ```bash
 cd mall-server
-# 首次运行请复制配置模板（.env 默认使用占位符，图片服务将自动走 NoOp 降级模式）
+# 首次运行请复制配置模板（OSS 留空时图片服务走 NoOp 降级模式）
 cp .env.example .env
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
 ```

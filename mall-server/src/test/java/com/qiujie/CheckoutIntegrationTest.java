@@ -19,6 +19,7 @@ import com.qiujie.mq.OrderTimeoutMessage;
 import com.qiujie.mq.SeckillMessage;
 import com.qiujie.service.OrderCancellationService;
 import com.qiujie.service.OrderService;
+import com.qiujie.service.ProductAdminService;
 import com.qiujie.service.SeckillService;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
@@ -60,6 +61,7 @@ import static org.awaitility.Awaitility.await;
 class CheckoutIntegrationTest {
     @Autowired private TestRestTemplate http;
     @Autowired private ProductMapper products;
+    @Autowired private ProductAdminService productAdmin;
     @Autowired private OrderMapper orders;
     @Autowired private OrderItemMapper items;
     @Autowired private SeckillSessionMapper sessions;
@@ -295,7 +297,7 @@ class CheckoutIntegrationTest {
     private int product(int stock) {
         Product product = new Product().setName("CI-" + UUID.randomUUID())
                 .setPrice(BigDecimal.TEN).setStock(stock).setCategoryId(1);
-        products.insert(product);
+        productAdmin.add(product);
         return product.getId();
     }
 
