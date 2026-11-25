@@ -78,10 +78,7 @@ task_plan.md
 application-prod.yml
 **/application-prod.yml
 
-# All test files & benchmarks (local only, never commit)
-*test*
-*Test*
-**/src/test/
+# Local end-to-end and benchmark artifacts
 **/e2e/
 **/playwright.config.*
 *benchmark*
