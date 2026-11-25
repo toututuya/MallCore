@@ -3,6 +3,7 @@ package com.qiujie.service.impl;
 import cn.hutool.core.util.IdUtil;
 import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.qiujie.entity.*;
@@ -12,13 +13,13 @@ import com.qiujie.enums.PayMethodEnum;
 import com.qiujie.exception.BusinessException;
 import com.qiujie.mapper.*;
 import com.qiujie.service.OrderService;
+import com.qiujie.service.OrderCancellationService;
 import com.qiujie.config.RabbitMQConfig;
+import com.qiujie.mq.ConfirmedPublisher;
 import com.qiujie.mq.OrderTimeoutMessage;
 import com.qiujie.common.RedisConstants;
 import com.qiujie.cache.RedisUtil;
 import com.qiujie.cache.SalesRankCache;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -45,14 +46,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     private final ProductImgMapper productImgMapper;
     private final RedisUtil redisUtil;
     private final SalesRankCache salesRankCache;
-
-    @Autowired(required = false)
-    private RabbitTemplate rabbitTemplate;
+    private final OrderCancellationService cancellations;
+    private final ConfirmedPublisher publisher;
 
     public OrderServiceImpl(OrderMapper orderMapper, OrderItemMapper orderItemMapper,
                             CartMapper cartMapper, ProductMapper productMapper,
                             ProductImgMapper productImgMapper, RedisUtil redisUtil,
-                            SalesRankCache salesRankCache) {
+                            SalesRankCache salesRankCache, OrderCancellationService cancellations,
+                            ConfirmedPublisher publisher) {
         this.orderMapper = orderMapper;
         this.orderItemMapper = orderItemMapper;
         this.cartMapper = cartMapper;
@@ -60,6 +61,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         this.productImgMapper = productImgMapper;
         this.redisUtil = redisUtil;
         this.salesRankCache = salesRankCache;
+        this.cancellations = cancellations;
+        this.publisher = publisher;
     }
 
     @Transactional
@@ -115,7 +118,6 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
 
         Order order = buildOrder(userId, addressId, payMethod, params);
         save(order);
-        sendTimeoutMessage(order.getId());
         for (Cart cart : selectedCarts) {
             Product product = productMap.get(cart.getProductId());
             if (product == null) {
@@ -134,6 +136,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             cartMapper.deleteById(cart.getId());
         }
 
+        sendTimeoutMessage(order.getId());
         return order;
     }
 
@@ -153,12 +156,12 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         Order order = buildOrder(userId, null, PayMethodEnum.UNKNOWN, params);
         order.setTotalAmount(product.getPrice().multiply(new BigDecimal(amount)));
         save(order);
-        sendTimeoutMessage(order.getId());
 
         ProductImg firstImg = productImgMapper.selectFirstByProductId(product.getId());
         String imgUrl = firstImg != null ? firstImg.getUrl() : null;
         OrderItem item = addOrderItem(order, product.getId(), product.getName(), product.getPrice(), imgUrl, amount);
         cacheOrderItems(order.getId());
+        sendTimeoutMessage(order.getId());
 
         order.setItems(List.of(item));
         return order;
@@ -172,14 +175,19 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (order.getStatus() != OrderStatusEnum.PENDING_PAY) {
             throw new BusinessException(BusinessStatusEnum.CONFLICT, "订单状态不正确");
         }
-        order.setStatus(OrderStatusEnum.PAID);
         order.setPaymentTime(LocalDateTime.now());
         order.setPaymentSn("PAY" + System.currentTimeMillis() + String.format("%04d", (int)(Math.random() * 10000)));
+        Integer paidMethod = null;
         if (payMethod != null && payMethod > 0) {
-            order.setPayMethod(PayMethodEnum.values()[payMethod]);
+            if (payMethod >= PayMethodEnum.values().length) {
+                throw new BusinessException(BusinessStatusEnum.PARAM_ERROR, "支付方式不合法");
+            }
+            paidMethod = PayMethodEnum.values()[payMethod].getCode();
         }
-        updateById(order);
-        adjustSalesRank(id, 1);
+        if (orderMapper.payPending(order, paidMethod) != 1) {
+            throw new BusinessException(BusinessStatusEnum.CONFLICT, "订单状态已改变");
+        }
+        recordPaidSale(id);
     }
 
     public List<Order> list(Integer userId) {
@@ -270,23 +278,13 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     }
 
     public void cancel(Integer id) {
-        Order order = getById(id);
-        if (order == null) {
+        OrderStatusEnum status = cancellations.cancel(id);
+        if (status == null) {
             throw new BusinessException(BusinessStatusEnum.NOT_FOUND, "订单不存在");
         }
-        if (order.getStatus() != OrderStatusEnum.PENDING_PAY) {
+        if (status != OrderStatusEnum.CANCELLED) {
             throw new BusinessException(BusinessStatusEnum.CONFLICT, "只有待支付订单可以取消");
         }
-        order.setStatus(OrderStatusEnum.CANCELLED);
-        updateById(order);
-        // 释放锁定库存
-        List<OrderItem> items = orderItemMapper.selectList(
-                new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<OrderItem>()
-                        .eq("order_id", id));
-        for (OrderItem item : items) {
-            productMapper.incrementStock(item.getProductId(), item.getAmount());
-        }
-        adjustSalesRank(id, -1);
     }
 
     public void receipt(Integer userId, Integer id) {
@@ -310,13 +308,13 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (order.getStatus() != OrderStatusEnum.PENDING_PAY) {
             throw new BusinessException(BusinessStatusEnum.CONFLICT, "订单状态不正确");
         }
-        order.setRecipientName(recipientName);
-        order.setRecipientPhone(recipientPhone);
-        order.setRecipientAddress(recipientAddress);
-        if (expressDelivery != null) {
-            order.setExpressDelivery(expressDelivery);
+        Order recipient = new Order().setRecipientName(recipientName).setRecipientPhone(recipientPhone)
+                .setRecipientAddress(recipientAddress).setExpressDelivery(expressDelivery)
+                .setUpdateTime(LocalDateTime.now());
+        if (orderMapper.update(recipient, Wrappers.<Order>lambdaUpdate().eq(Order::getId, id)
+                .eq(Order::getUserId, userId).eq(Order::getStatus, OrderStatusEnum.PENDING_PAY)) != 1) {
+            throw new BusinessException(BusinessStatusEnum.CONFLICT, "订单状态已改变");
         }
-        updateById(order);
     }
 
     public void batchDeliver(List<Integer> ids) {
@@ -392,13 +390,12 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
      * 发送订单超时取消延时消息到 TTL 队列
      */
     private void sendTimeoutMessage(Integer orderId) {
-        if (rabbitTemplate == null) return;
         OrderTimeoutMessage msg = new OrderTimeoutMessage();
         msg.setOrderId(orderId);
-        rabbitTemplate.convertAndSend(RabbitMQConfig.ORDER_DELAY_QUEUE, msg);
+        publisher.send("", RabbitMQConfig.ORDER_DELAY_QUEUE, msg, outbound -> outbound);
     }
 
-    /** 缓存订单商品快照到 Redis，避免 adjustSalesRank 查 DB */
+    /** 缓存订单商品快照到 Redis，供支付后的销量统计使用。 */
     private void cacheOrderItems(Integer orderId) {
         List<OrderItem> items = orderItemMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<OrderItem>()
@@ -414,7 +411,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         redisUtil.set(RedisConstants.ORDER_ITEMS_SNAPSHOT_KEY + orderId, JSONUtil.toJsonStr(snapshot), 3600);
     }
 
-    private void adjustSalesRank(Integer orderId, int delta) {
+    private void recordPaidSale(Integer orderId) {
         String json = (String) redisUtil.get(RedisConstants.ORDER_ITEMS_SNAPSHOT_KEY + orderId);
         if (json == null) {
             // 兜底：缓存未命中时查 DB
@@ -422,11 +419,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
                     new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<OrderItem>()
                             .eq("order_id", orderId));
             for (OrderItem item : items) {
-                if (delta > 0) {
-                    salesRankCache.recordSale(item.getProductId(), item.getAmount());
-                } else {
-                    salesRankCache.recordCancel(item.getProductId(), item.getAmount());
-                }
+                salesRankCache.recordSale(item.getProductId(), item.getAmount());
             }
             return;
         }
@@ -435,11 +428,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         for (Map<String, Object> item : snapshot) {
             int productId = (int) item.get("productId");
             int amount = (int) item.get("amount");
-            if (delta > 0) {
-                salesRankCache.recordSale(productId, amount);
-            } else {
-                salesRankCache.recordCancel(productId, amount);
-            }
+            salesRankCache.recordSale(productId, amount);
         }
     }
 }

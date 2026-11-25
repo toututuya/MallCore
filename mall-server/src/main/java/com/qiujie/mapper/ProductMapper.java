@@ -5,11 +5,15 @@ import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.qiujie.entity.Product;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
 
 import java.time.LocalDateTime;
 import java.util.List;
 
 public interface ProductMapper extends BaseMapper<Product> {
+
+    @Select("SELECT id FROM pms_product WHERE id = #{id} FOR UPDATE")
+    Integer lockForOrder(@Param("id") Integer id);
 
     /**
      * 原子扣减库存。利用 MySQL 行锁保证不超卖

@@ -44,11 +44,14 @@ spring:
     port: ${spring.rabbitmq.port}
     username: ${spring.rabbitmq.username}
     password: ${spring.rabbitmq.password}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    template:
+      mandatory: true
     listener:
       simple:
         prefetch: 1
         concurrency: 4
-        acknowledge-mode: manual
 
   elasticsearch:
     uris: ${spring.elasticsearch.uris}

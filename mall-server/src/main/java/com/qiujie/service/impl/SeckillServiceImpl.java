@@ -31,21 +31,24 @@ import com.qiujie.mapper.ProductMapper;
 import com.qiujie.mapper.SeckillSessionMapper;
 // 秒杀消息体，发送到 RabbitMQ 的订单创建消息
 import com.qiujie.mq.SeckillMessage;
+import com.qiujie.mq.ConfirmedPublisher;
 // 秒杀服务接口
 import com.qiujie.service.SeckillService;
 // Redis 工具类，封装了 RedisTemplate 的常用操作和 Lua 脚本执行
 import com.qiujie.cache.RedisUtil;
-// Spring RabbitMQ 模板，用于发送消息到交换机
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import com.qiujie.cache.SeckillReservationStore;
+import lombok.extern.slf4j.Slf4j;
 // Spring 服务层注解，标记为 Spring Bean
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * 秒杀活动业务实现
@@ -62,11 +65,9 @@ import java.util.Map;
  * @author qiujie
  */
 @Service
+@Slf4j
 public class SeckillServiceImpl extends ServiceImpl<SeckillSessionMapper, SeckillSession> implements SeckillService {
 
-    // Redis Key 前缀：用户秒杀订单标记，格式 seckill:order:{场次ID}:{用户ID}
-    // 用于防重判断——同一用户在同一场次只能秒杀一次
-    private static final String SECKILL_ORDER_KEY = "seckill:order:";
     // Redis Key 前缀：秒杀结果缓存，格式 seckill:result:{场次ID}:{用户ID}
     // 前端轮询此 Key 获取订单创建结果（排队中 / 成功 / 失败）
     private static final String SECKILL_RESULT_KEY = "seckill:result:";
@@ -79,8 +80,8 @@ public class SeckillServiceImpl extends ServiceImpl<SeckillSessionMapper, Seckil
     private final ProductImgMapper productImgMapper;
     // Redis 工具类，封装 get/set/del/executeLua 操作
     private final RedisUtil redisUtil;
-    // RabbitMQ 模板，用于发送秒杀订单创建消息
-    private final RabbitTemplate rabbitTemplate;
+    private final ConfirmedPublisher publisher;
+    private final SeckillReservationStore reservations;
 
     /**
      * 构造器注入（Spring 推荐方式，无需 @Autowired）
@@ -91,18 +92,21 @@ public class SeckillServiceImpl extends ServiceImpl<SeckillSessionMapper, Seckil
      * @param productMapper        商品 Mapper
      * @param productImgMapper     商品图片 Mapper
      * @param redisUtil            Redis 工具类
-     * @param rabbitTemplate       RabbitMQ 模板
+     * @param publisher            带发布确认的消息发送器
+     * @param reservations         秒杀库存预留
      */
     public SeckillServiceImpl(SeckillSessionMapper seckillSessionMapper,
                               ProductMapper productMapper,
                               ProductImgMapper productImgMapper,
                               RedisUtil redisUtil,
-                              RabbitTemplate rabbitTemplate) {
+                              ConfirmedPublisher publisher,
+                              SeckillReservationStore reservations) {
         this.seckillSessionMapper = seckillSessionMapper;
         this.productMapper = productMapper;
         this.productImgMapper = productImgMapper;
         this.redisUtil = redisUtil;
-        this.rabbitTemplate = rabbitTemplate;
+        this.publisher = publisher;
+        this.reservations = reservations;
     }
 
     /**
@@ -178,141 +182,60 @@ public class SeckillServiceImpl extends ServiceImpl<SeckillSessionMapper, Seckil
         return result;
     }
 
-    /**
-     * 执行秒杀——核心方法
-     * <p>
-     * 流程：
-     * <ol>
-     *   <li>校验场次是否存在且处于活动时间范围内</li>
-     *   <li>Redis Lua 脚本原子执行：库存初始化 → 防重检查 → 扣库存 → 标记用户已参与</li>
-     *   <li>清除秒杀列表缓存，使下次查询获取最新库存</li>
-     *   <li>发送 RabbitMQ 消息，异步创建订单（削峰）</li>
-     *   <li>MQ 发送失败时，Lua 脚本回滚库存和用户标记</li>
-     * </ol>
-     * <p>
-     * 为什么要用 Lua 脚本：
-     * <ul>
-     *   <li>原子性：Redis 单线程执行 Lua，避免「查库存 → 判断 → 扣库存」之间的竞态条件</li>
-     *   <li>减少网络往返：4 次 Redis 操作合并为 1 次网络调用</li>
-     * </ul>
-     *
-     * @param sessionId 秒杀场次 ID
-     * @param userId    用户 ID
-     * @throws BusinessException 场次不存在 / 已过期 / 重复秒杀 / 库存不足 / 系统异常
-     */
     @Override
     public void execute(Integer sessionId, Integer userId) {
-        // ========== 1. 校验秒杀场次存在且进行中 ==========
         SeckillSession session = seckillSessionMapper.selectById(sessionId);
         if (session == null) {
-            // 场次不存在，抛出业务异常（全局异常处理器会转为统一响应格式）
             throw new BusinessException(BusinessStatusEnum.NOT_FOUND, "秒杀活动不存在");
         }
         LocalDateTime now = LocalDateTime.now();
         if (now.isBefore(session.getStartTime()) || now.isAfter(session.getEndTime())) {
-            // 当前时间不在场次的 start_time ~ end_time 范围内
             throw new BusinessException(BusinessStatusEnum.CONFLICT, "秒杀活动已结束");
         }
 
-        // ========== 2. Lua 脚本原子执行 ==========
-        // Redis Key：秒杀库存，格式 seckill:stock:{场次ID}
-        String stockKey = SECKILL_STOCK_KEY + sessionId;
-        // Redis Key：用户秒杀标记，格式 seckill:order:{场次ID}:{用户ID}
-        // 用于防重——同一用户在同一场次只能秒杀一次
-        String orderKey = SECKILL_ORDER_KEY + sessionId + ":" + userId;
-        // Lua 脚本：Redis 单线程原子执行，避免并发竞态
-        // KEYS[1] = stockKey   KEYS[2] = orderKey
-        // ARGV[1] = 初始库存   ARGV[2] = 用户标记过期时间(秒)
-        String lua = """
-            local stockKey = KEYS[1]
-            local orderKey = KEYS[2]
-            local initStock = tonumber(ARGV[1])
-            local orderTtl = tonumber(ARGV[2])
-
-            -- 库存 Key 不存在 → 首次访问，用数据库库存初始化 Redis 库存
-            if redis.call('EXISTS', stockKey) == 0 then
-                redis.call('SET', stockKey, initStock)
-            end
-
-            -- 防重检查：用户秒杀标记 Key 是否存在
-            if redis.call('EXISTS', orderKey) == 1 then
-                return -1    -- 重复秒杀
-            end
-
-            -- 读取库存并去引号后转为数字
-            -- 注：RedisTemplate 序列化会给值加双引号，需 gsub('"','') 去除
-            local raw = redis.call('GET', stockKey) or '0'
-            raw = raw:gsub('"', '')
-            local stock = tonumber(raw)
-            if stock <= 0 then
-                return -2    -- 库存不足
-            end
-
-            -- 扣库存 + 标记用户已参与（带 TTL）
-            redis.call('SET', stockKey, stock - 1)
-            redis.call('SET', orderKey, '1', 'EX', orderTtl)
-            return 1          -- 秒杀成功
-            """;
-
-        // 执行 Lua 脚本：传入 KEYS 列表和 ARGV 参数列表
-        // 返回值类型为 Long：-1=重复，-2=库存不足，1=成功
-        Long result = redisUtil.executeLua(lua, Long.class,
-                List.of(stockKey, orderKey),
-                session.getSeckillStock(), 86400); // orderTtl=86400秒=24小时
-        if (result == null) {
-            // Lua 脚本执行异常（如 Redis 连接断开）
-            throw new BusinessException(BusinessStatusEnum.SERVER_ERROR, "秒杀库存扣减失败");
-        }
-        if (result == -1) {
-            // 用户已参与过该场次秒杀
-            throw new BusinessException(BusinessStatusEnum.CONFLICT, "您已参与过此秒杀活动");
-        }
-        if (result == -2) {
-            // 库存已耗尽
-            throw new BusinessException(BusinessStatusEnum.CONFLICT, "已抢光");
-        }
-
-        // ========== 3. 失效秒杀缓存 ==========
-        // 库存已变化，删除进行中/即将开始场次的列表缓存
-        // 下次查询时 Cache-Aside 模式会重新从数据库加载并写入缓存
-        redisUtil.del(CACHE_SECKILL_ACTIVE_KEY);
-        redisUtil.del(CACHE_SECKILL_UPCOMING_KEY);
-
-        // ========== 4. 发送 RabbitMQ 消息，异步创建订单 ==========
-        // 构建秒杀消息体，包含创建订单所需的全部字段
         SeckillMessage message = new SeckillMessage();
         message.setSessionId(sessionId);
         message.setUserId(userId);
         message.setProductId(session.getProductId());
         message.setSeckillPrice(session.getSeckillPrice());
-        if (rabbitTemplate == null) {
-            // 防御性检查：RabbitMQ 未配置时直接抛异常
-            throw new BusinessException(BusinessStatusEnum.SERVER_ERROR, "秒杀服务暂不可用");
+        String reservationId = UUID.randomUUID().toString();
+        message.setReservationId(reservationId);
+
+        Duration retention = Duration.between(now, session.getEndTime()).plusDays(1);
+        long result = reservations.reserve(sessionId, userId, session.getSeckillStock(), reservationId, retention);
+        if (result == SeckillReservationStore.DUPLICATE) {
+            throw new BusinessException(BusinessStatusEnum.CONFLICT, "您已参与过此秒杀活动");
         }
+        if (result == SeckillReservationStore.SOLD_OUT) {
+            throw new BusinessException(BusinessStatusEnum.CONFLICT, "已抢光");
+        }
+
         try {
-            // 发送消息到秒杀交换机，路由键为 seckill
-            // 消息由 SeckillMessageListener 消费，执行数据库订单创建
-            rabbitTemplate.convertAndSend(RabbitMQConfig.SECKILL_EXCHANGE,
-                    RabbitMQConfig.SECKILL_ROUTING_KEY, message);
-        } catch (Exception e) {
-            // ========== MQ 发送失败：Lua 脚本回滚 ==========
-            // 为什么需要回滚？库存已在步骤 2 中扣减，但订单创建消息未发出
-            // 如果不回滚，用户扣了库存但永远收不到订单，造成"超卖但不成交"
-            //
-            // 回滚操作：
-            //   KEYS[1]=stockKey  → 库存 +1
-            //   KEYS[2]=orderKey  → 删除用户秒杀标记，允许重新秒杀
-            String rollbackLua = """
-                local raw = redis.call('GET', KEYS[1])
-                if raw then
-                    raw = raw:gsub('"', '')
-                    redis.call('SET', KEYS[1], tonumber(raw) + 1)
-                end
-                redis.call('DEL', KEYS[2])
-                """;
-            // Void.class 表示不需要返回值，仅执行副作用
-            redisUtil.executeLua(rollbackLua, Void.class, List.of(stockKey, orderKey));
-            throw new BusinessException(BusinessStatusEnum.SERVER_ERROR, "秒杀消息发送失败");
+            publisher.send(RabbitMQConfig.SECKILL_EXCHANGE, RabbitMQConfig.SECKILL_ROUTING_KEY, message,
+                    outbound -> outbound);
+        } catch (RuntimeException publishFailure) {
+            // A late delivery can only create an order if it claims this reservation before the release.
+            boolean released;
+            try {
+                released = reservations.releaseUnclaimed(sessionId, userId, reservationId);
+            } catch (RuntimeException rollbackFailure) {
+                publishFailure.addSuppressed(rollbackFailure);
+                log.error("Unable to resolve seckill publish reservation {}", reservationId, publishFailure);
+                throw new BusinessException(BusinessStatusEnum.SERVER_ERROR, "提交状态待确认，请查询秒杀结果");
+            }
+            if (released) {
+                log.warn("Released seckill reservation {} after failed publish", reservationId, publishFailure);
+                throw new BusinessException(BusinessStatusEnum.SERVER_ERROR, "秒杀消息发送失败");
+            }
+            log.warn("Seckill publish outcome unknown after reservation {} left request ownership",
+                    reservationId, publishFailure);
+        }
+
+        try {
+            redisUtil.del(CACHE_SECKILL_ACTIVE_KEY);
+            redisUtil.del(CACHE_SECKILL_UPCOMING_KEY);
+        } catch (RuntimeException failure) {
+            log.warn("Could not invalidate session list cache after seckill {}", sessionId, failure);
         }
     }
 

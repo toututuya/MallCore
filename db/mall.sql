@@ -296,6 +296,11 @@ UNLOCK TABLES;
 -- Table structure for table `oms_order_item`
 --
 
+CREATE TABLE IF NOT EXISTS `oms_order_stock_release` (
+  `order_id` INT NOT NULL PRIMARY KEY,
+  `session_id` INT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 DROP TABLE IF EXISTS `oms_order_item`;
 /*!40101 SET @saved_cs_client     = @@character_set_client */;
 /*!50503 SET character_set_client = utf8mb4 */;

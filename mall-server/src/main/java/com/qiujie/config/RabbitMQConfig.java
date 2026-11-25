@@ -2,11 +2,19 @@ package com.qiujie.config;
 
 import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.core.BindingBuilder;
+import org.springframework.amqp.core.AcknowledgeMode;
 import org.springframework.amqp.core.DirectExchange;
 import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.core.QueueBuilder;
+import org.springframework.amqp.rabbit.config.RetryInterceptorBuilder;
+import org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory;
+import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
+import org.springframework.amqp.rabbit.connection.ConnectionFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.retry.RepublishMessageRecovererWithConfirms;
 import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.boot.autoconfigure.amqp.SimpleRabbitListenerContainerFactoryConfigurer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -27,6 +35,8 @@ public class RabbitMQConfig {
     public static final String ORDER_TIMEOUT_EXCHANGE = "order.timeout.exchange";
     public static final String ORDER_TIMEOUT_QUEUE = "order.timeout.queue";
     public static final String ORDER_TIMEOUT_ROUTING_KEY = "order.timeout";
+    public static final String ORDER_TIMEOUT_FAILED_QUEUE = "order.timeout.failed.queue";
+    public static final String SECKILL_FAILED_QUEUE = "seckill.order.failed.queue";
     private static final int ORDER_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟
 
     // ======================== 秒杀队列 ========================
@@ -106,6 +116,16 @@ public class RabbitMQConfig {
     }
 
     @Bean
+    public Queue orderTimeoutFailedQueue() {
+        return QueueBuilder.durable(ORDER_TIMEOUT_FAILED_QUEUE).build();
+    }
+
+    @Bean
+    public Queue seckillFailedQueue() {
+        return QueueBuilder.durable(SECKILL_FAILED_QUEUE).build();
+    }
+
+    @Bean
     public MessageConverter jsonMessageConverter() {
         Jackson2JsonMessageConverter converter = new Jackson2JsonMessageConverter();
         converter.setCreateMessageIds(true);
@@ -113,13 +133,32 @@ public class RabbitMQConfig {
     }
 
     @Bean
-    public org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
-            org.springframework.amqp.rabbit.connection.ConnectionFactory connectionFactory,
-            MessageConverter jsonMessageConverter) {
-        org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory factory =
-                new org.springframework.amqp.rabbit.config.SimpleRabbitListenerContainerFactory();
-        factory.setConnectionFactory(connectionFactory);
+    public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+            ConnectionFactory connectionFactory, MessageConverter jsonMessageConverter,
+            SimpleRabbitListenerContainerFactoryConfigurer configurer) {
+        return listenerFactory(connectionFactory, jsonMessageConverter, configurer, AcknowledgeMode.MANUAL);
+    }
+
+    @Bean
+    public SimpleRabbitListenerContainerFactory orderTimeoutListenerContainerFactory(
+            ConnectionFactory connectionFactory, MessageConverter jsonMessageConverter, RabbitTemplate rabbit,
+            SimpleRabbitListenerContainerFactoryConfigurer configurer) {
+        SimpleRabbitListenerContainerFactory factory =
+                listenerFactory(connectionFactory, jsonMessageConverter, configurer, AcknowledgeMode.AUTO);
+        RepublishMessageRecovererWithConfirms recoverer = new RepublishMessageRecovererWithConfirms(
+                rabbit, "", ORDER_TIMEOUT_FAILED_QUEUE, CachingConnectionFactory.ConfirmType.CORRELATED);
+        factory.setAdviceChain(RetryInterceptorBuilder.stateless().maxAttempts(3)
+                .backOffOptions(200, 2, 800).recoverer(recoverer).build());
+        return factory;
+    }
+
+    private SimpleRabbitListenerContainerFactory listenerFactory(
+            ConnectionFactory connectionFactory, MessageConverter jsonMessageConverter,
+            SimpleRabbitListenerContainerFactoryConfigurer configurer, AcknowledgeMode ackMode) {
+        SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+        configurer.configure(factory, connectionFactory);
         factory.setMessageConverter(jsonMessageConverter);
+        factory.setAcknowledgeMode(ackMode);
         return factory;
     }
 }

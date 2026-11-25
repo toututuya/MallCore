@@ -1,0 +1,61 @@
+name: MallCore backend
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  checkout-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MALLCORE_INTEGRATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          cache-dependency-path: mall-server/pom.xml
+
+      - name: Start MySQL, Redis, RabbitMQ and Elasticsearch
+        run: docker compose -f docker/local/docker-compose.yml up -d mysql redis rabbitmq elasticsearch
+
+      - name: Wait for the database schema and services
+        shell: bash
+        run: |
+          mysql_ready() {
+            docker exec mall-mysql mysql -h127.0.0.1 -uroot -p123456 mall -Nse 'SELECT COUNT(*) FROM oms_order_stock_release' >/dev/null 2>&1
+          }
+          redis_ready() {
+            docker exec mall-redis redis-cli -a 123456 ping 2>/dev/null | grep -qx PONG
+          }
+          rabbit_ready() {
+            docker exec mall-rabbitmq rabbitmq-diagnostics -q check_port_connectivity >/dev/null 2>&1
+          }
+          for attempt in {1..75}; do
+            if mysql_ready && redis_ready && rabbit_ready && curl --max-time 2 -fsS http://localhost:19200 >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Run Java checkout and seckill tests
+        working-directory: mall-server
+        run: |
+          cp .env.example .env
+          mvn -B -ntp verify
+
+      - name: Print service logs on failure
+        if: failure()
+        run: docker compose -f docker/local/docker-compose.yml logs --tail 80
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-reports
+          path: mall-server/target/surefire-reports/
+          if-no-files-found: ignore

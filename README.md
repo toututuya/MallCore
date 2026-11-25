@@ -1,4 +1,56 @@
-# mall — 全栈电商系统
+# MallCore · Java 交易后端可靠性实践
+
+[![MallCore backend](https://github.com/toututuya/MallCore/actions/workflows/backend.yml/badge.svg)](https://github.com/toututuya/MallCore/actions/workflows/backend.yml)
+
+MallCore 基于 [quuuuj/mall](https://github.com/quuuuj/mall/tree/76b727c159aa72a9a55f7a2073f0710e4381ddff) 二次开发，沿用其商品、购物车、订单和秒杀底座。改造集中在未支付订单取消、秒杀消息发送与补偿、数据库幂等和失败验证。项目保留上游提交历史，采用 [GPL-3.0](LICENSE)。
+
+## 后端改造
+
+| 场景 | 实现 |
+| --- | --- |
+| 支付与取消并发 | 两个入口均以待支付为更新条件。取消在同一个 MySQL 事务中更新状态、恢复商品库存，并为秒杀订单记录 Redis 回补任务。 |
+| 超时消息失败 | 保留 RabbitMQ TTL + DLX 延时链路。处理失败最多尝试三次，耗尽后确认转发到 `order.timeout.failed.queue`，可检查原因并重放。Redis 补偿按订单 ID 做幂等，数据库事务已经提交时可单独重跑补偿。 |
+| 秒杀发布失败 | Redis Lua 原子预扣和防重并生成预留状态。发布确认失败时，只归还仍由请求端持有的预留。已认领的消息保持消费端处理，迟到的旧消息无法认领下一次预留。 |
+| 秒杀重试与重复投递 | 商品行锁协调订单创建与最终补偿，数据库唯一键约束同一用户和场次。三次延迟重试用尽后核对数据库，只有无订单的预留才退库存。无法完成核对或补偿的消息保留在 `seckill.order.failed.queue`。 |
+
+```mermaid
+flowchart LR
+    A["秒杀请求"] --> B["Redis Lua 预留"]
+    B --> C["RabbitMQ 发布确认"]
+    C -->|"未认领且发布失败"| D["归还本次预留"]
+    C -->|"消息投递"| E["认领预留"]
+    E --> F["MySQL 扣库存与建单"]
+    F --> H["TTL 延时队列"]
+    H --> I["超时取消"]
+    P["支付"] --> J["条件更新待支付订单"]
+    I --> J
+    J -->|"取消成功"| K["事务内释放商品库存"]
+    K -->|"秒杀订单"| L["按订单 ID 回补 Redis"]
+```
+
+## 运行与验证
+
+在仓库根目录使用 PowerShell。首次启动的 Compose 会导入 `db/mall.sql`，已有数据库需先执行 [迁移脚本](db/migrations/001_order_stock_release.sql)。支付接口使用模拟支付。
+
+```powershell
+docker compose -f docker/local/docker-compose.yml up -d mysql redis rabbitmq elasticsearch
+Copy-Item mall-server/.env.example mall-server/.env
+Set-Location mall-server
+.\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=dev
+```
+
+交易回归需要独立的测试库及队列。默认 `mvn test` 运行 H2 SQL 回归。启动上述 Compose 后，在 `mall-server` 下执行以下命令，可与 [GitHub Actions](https://github.com/toututuya/MallCore/actions/workflows/backend.yml) 运行相同的真实中间件用例。
+
+```powershell
+$env:MALLCORE_INTEGRATION = 'true'
+.\mvnw.cmd verify
+```
+
+覆盖商品详情、购物车、下单及模拟支付，以及支付与取消竞态、超时失败消息、发布不可路由、迟到投递和重试耗尽。秒杀并发用例向 20 件库存提交 100 次请求，校验订单数、用户去重、Redis 和 MySQL 库存。它验证并发正确性，吞吐测量需要单独的负载实验。
+
+Redis 预留与 MQ 发布之间仍有进程崩溃窗口。异常队列可供人工核对和重放。若 Redis 数据丢失，需先对账后恢复场次库存。
+
+## 上游商城功能与使用说明
 
 ![License](https://img.shields.io/badge/License-GPL--3.0-blue.svg)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.2.5-brightgreen.svg)
@@ -6,7 +58,7 @@
 
 基于 Spring Boot 3 + Vue 3 的 B2C 电商平台，覆盖用户注册登录、商品浏览、购物车、下单、支付全流程，并内置高并发秒杀系统与多 Agent 智能客服。
 
-## 在线体验
+## 上游在线体验
 
 - **用户门户（商城前台）**：https://mall.qiujie.net.cn
 - **管理后台（运营端）**：https://mall.qiujie.net.cn/admin/
