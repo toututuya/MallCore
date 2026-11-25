@@ -51,7 +51,9 @@ jobs:
 
       - name: Print service logs on failure
         if: failure()
-        run: docker compose -f docker/local/docker-compose.yml logs --tail 80
+        run: |
+          docker compose -f docker/local/docker-compose.yml ps -a
+          docker compose -f docker/local/docker-compose.yml logs --tail 80
 
       - uses: actions/upload-artifact@v4
         if: always()
